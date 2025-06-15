@@ -7,13 +7,13 @@ from datetime import datetime
 
 # --- KONFIGURASI DASAR & KONEKSI GOOGLE SHEET ---
 
-# Atur Judul dan ikon halaman TEST
+# Atur Judul dan ikon halaman
 st.set_page_config(page_title="Data Tagihan Air", page_icon="💧", layout="wide")
 
 # --- KONSTANTA ---
-HARGA_PER_METER_KUBIK = 2500  # Contoh harga: Rp 2.500 per m³
-NAMA_GOOGLE_SHEET = "Database Tagihan Air" # Nama file Google Sheet Anda
-NAMA_WORKSHEET = "Sheet1" # Nama worksheet di dalam file
+NAMA_GOOGLE_SHEET = "Database Tagihan Air"  # Nama file Google Sheet
+NAMA_WORKSHEET_DATA = "Sheet1"  # Nama worksheet untuk data utama
+NAMA_WORKSHEET_KONFIG = "Konfigurasi"  # Nama worksheet untuk pengaturan harga
 
 # Definisikan Konstanta Nama Kolom untuk perawatan kode yang lebih mudah
 COL_KODE_PELANGGAN = 'KODE PELANGGAN'
@@ -38,13 +38,12 @@ COLUMN_ORDER = [
     COL_TUNGGAKAN_LALU, COL_TOTAL_TAGIHAN, COL_TANGGAL_INPUT
 ]
 
-
 # --- FUNGSI-FUNGSI ---
 
 # Fungsi untuk koneksi ke Google Sheets menggunakan Streamlit Secrets
 @st.cache_resource
 def connect_to_gsheet():
-    """Menghubungkan ke Google Sheet dan mengembalikan objek worksheet."""
+    """Menghubungkan ke Google Sheet dan mengembalikan objek spreadsheet."""
     try:
         scopes = [
             'https://www.googleapis.com/auth/spreadsheets',
@@ -55,21 +54,75 @@ def connect_to_gsheet():
         )
         gc = gspread.authorize(creds)
         spreadsheet = gc.open(NAMA_GOOGLE_SHEET)
-        worksheet = spreadsheet.worksheet(NAMA_WORKSHEET)
-        return worksheet
+        return spreadsheet
     except Exception as e:
         st.error(f"Gagal terhubung ke Google Sheets. Pastikan API telah diaktifkan dan Sheet sudah di-share. Error: {e}")
         return None
 
+# Fungsi untuk memuat harga dari worksheet Konfigurasi
+@st.cache_data(ttl=300)  # Cache harga selama 5 menit
+def load_config(_spreadsheet):
+    """Membaca harga per meter kubik dari worksheet 'Konfigurasi'."""
+    default_price = 2500  # Harga default jika gagal memuat
+    if not _spreadsheet:
+        return default_price
+    try:
+        config_ws = _spreadsheet.worksheet(NAMA_WORKSHEET_KONFIG)
+        config_df = get_as_dataframe(config_ws, usecols=[0, 1], header=0)
+        config_df.dropna(how='all', inplace=True)
+        harga_row = config_df[config_df['Key'] == 'Harga Per Meter Kubik']
+        if not harga_row.empty:
+            harga = pd.to_numeric(harga_row['Value'].iloc[0], errors='coerce')
+            if pd.isna(harga):
+                st.warning(f"Nilai harga tidak valid di sheet '{NAMA_WORKSHEET_KONFIG}'. Menggunakan harga default (Rp {default_price:,}).")
+                return default_price
+            return harga
+        else:
+            st.warning(f"Key 'Harga Per Meter Kubik' tidak ditemukan di sheet '{NAMA_WORKSHEET_KONFIG}'. Menggunakan harga default (Rp {default_price:,}).")
+            return default_price
+    except gspread.exceptions.WorksheetNotFound:
+        st.warning(f"Worksheet '{NAMA_WORKSHEET_KONFIG}' tidak ditemukan. Menggunakan harga default (Rp {default_price:,}).")
+        return default_price
+    except Exception as e:
+        st.error(f"Gagal memuat konfigurasi harga. Error: {e}. Menggunakan harga default (Rp {default_price:,}).")
+        return default_price
+
+# Fungsi untuk memperbarui harga di worksheet Konfigurasi
+def update_config(_spreadsheet, new_price):
+    """Memperbarui harga per meter kubik di worksheet 'Konfigurasi'."""
+    try:
+        config_ws = _spreadsheet.worksheet(NAMA_WORKSHEET_KONFIG)
+        config_df = get_as_dataframe(config_ws, usecols=[0, 1], header=0)
+        config_df.dropna(how='all', inplace=True)
+        if config_df.empty:
+            # Jika sheet kosong, buat header dan tambahkan harga
+            config_ws.update([['Key', 'Value']], 'A1')
+            config_ws.append_row(['Harga Per Meter Kubik', new_price], value_input_option='USER_ENTERED')
+        else:
+            # Cari baris dengan key 'Harga Per Meter Kubik'
+            harga_row_idx = config_df[config_df['Key'] == 'Harga Per Meter Kubik'].index
+            if not harga_row_idx.empty:
+                # Update nilai di baris yang ada (1-based index, +2 karena header)
+                config_ws.update_cell(harga_row_idx[0] + 2, 2, new_price)
+            else:
+                # Tambahkan baris baru jika key tidak ditemukan
+                config_ws.append_row(['Harga Per Meter Kubik', new_price], value_input_option='USER_ENTERED')
+        st.cache_data.clear()  # Hapus cache setelah update
+        st.success(f"✅ Harga per m³ berhasil diperbarui menjadi Rp {new_price:,.0f}!")
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"Worksheet '{NAMA_WORKSHEET_KONFIG}' tidak ditemukan. Silakan buat worksheet tersebut terlebih dahulu.")
+    except Exception as e:
+        st.error(f"Gagal memperbarui harga di Google Sheets. Error: {e}")
+
 # Fungsi untuk memuat data dari worksheet
-@st.cache_data(ttl=60) # Cache data selama 60 detik
+@st.cache_data(ttl=60)  # Cache data selama 60 detik
 def load_data(_worksheet):
     """Memuat data dari worksheet, membersihkan, dan mengonversi tipe data."""
     if not _worksheet:
         return pd.DataFrame()
     try:
         df = get_as_dataframe(_worksheet, parse_dates=True, header=0, usecols=list(range(len(COLUMN_ORDER))))
-        df.columns = COLUMN_ORDER # Pastikan nama kolom sesuai urutan
+        df.columns = COLUMN_ORDER  # Pastikan nama kolom sesuai urutan
         df.dropna(how='all', inplace=True)
         
         numeric_cols = [
@@ -93,9 +146,23 @@ def load_data(_worksheet):
         st.error(f"Gagal memuat data dari worksheet. Error: {e}")
         return pd.DataFrame()
 
-# Panggil fungsi koneksi dan muat data
-worksheet = connect_to_gsheet()
-df = load_data(worksheet)
+# Panggil fungsi koneksi
+spreadsheet = connect_to_gsheet()
+if spreadsheet:
+    # Muat harga dari konfigurasi
+    HARGA_PER_METER_KUBIK = load_config(spreadsheet)
+    # Muat data pelanggan
+    try:
+        worksheet = spreadsheet.worksheet(NAMA_WORKSHEET_DATA)
+        df = load_data(worksheet)
+    except gspread.exceptions.WorksheetNotFound:
+        st.error(f"Worksheet '{NAMA_WORKSHEET_DATA}' tidak ditemukan. Silakan buat terlebih dahulu.")
+        worksheet = None
+        df = pd.DataFrame()
+else:
+    HARGA_PER_METER_KUBIK = 2500
+    worksheet = None
+    df = pd.DataFrame()
 
 # --- TAMPILAN APLIKASI STREAMLIT ---
 
@@ -103,7 +170,7 @@ st.title("💧 Aplikasi Pendataan & Pembayaran Air Bersih")
 st.markdown("---")
 
 # Membuat tab untuk memisahkan fungsionalitas
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard & Data Pelanggan", "📝 Input & Pembayaran (Update)", "👤 Tambah Pelanggan Baru"])
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Dashboard & Data Pelanggan", "📝 Input & Pembayaran (Update)", "👤 Tambah Pelanggan Baru", "⚙️ Pengaturan Harga"])
 
 with tab1:
     st.header("Dashboard Informasi")
@@ -114,9 +181,10 @@ with tab1:
         total_pelanggan = last_entries[COL_KODE_PELANGGAN].nunique()
         total_sisa_tagihan = last_entries[COL_SISA_TAGIHAN].sum()
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Jumlah Pelanggan Aktif", f"{total_pelanggan} orang")
         col2.metric("Estimasi Total Sisa Tagihan Pelanggan", f"Rp {total_sisa_tagihan:,.0f}")
+        col3.metric("Harga per m³ (Aktif)", f"Rp {HARGA_PER_METER_KUBIK:,.0f}")
 
     st.header("Data Seluruh Pelanggan")
     if st.button("🔄 Refresh Data"):
@@ -135,7 +203,6 @@ with tab1:
         }, na_rep='-'))
     else:
         st.warning("Gagal memuat data atau data masih kosong. Periksa koneksi dan konfigurasi, atau tambahkan pelanggan baru.")
-
 
 with tab2:
     st.header("Input Pembayaran & Meteran Bulan Ini")
@@ -168,16 +235,12 @@ with tab2:
 
             st.info(f"Mengupdate data untuk: **{nama_pelanggan_terpilih}** (Kode: {kode_pelanggan})")
             
-            # --- PERUBAHAN STRUKTUR ---
-            # 1. Tampilkan data referensi di luar form
             st.subheader("Data Bulan Lalu (Sebagai Referensi)")
             
-            # Ambil semua data referensi dari data_terakhir
             meter_lalu_untuk_hitung = data_terakhir[COL_METER_INI]
             tunggakan_dibawa = data_terakhir[COL_SISA_TAGIHAN]
             total_tagihan_lalu = data_terakhir[COL_TOTAL_TAGIHAN]
             
-            # Tampilkan dalam kolom
             ref_col1, ref_col2, ref_col3 = st.columns(3)
             ref_col1.metric("Jumlah Meter Bulan Lalu (m³)", f"{meter_lalu_untuk_hitung:,.0f}")
             ref_col2.metric("Tunggakan dari Bulan Lalu", f"Rp {tunggakan_dibawa:,.0f}")
@@ -185,7 +248,6 @@ with tab2:
             
             st.markdown("---")
 
-            # 2. Form hanya untuk input data baru
             with st.form("form_pembayaran_update"):
                 st.write("**Input Data Baru**")
                 in_col1, in_col2 = st.columns(2)
@@ -222,7 +284,6 @@ with tab2:
                             COL_TANGGAL_INPUT: datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         }
                         
-                        # --- PERUBAHAN TAMPILAN HASIL ---
                         st.success("Perhitungan Ulang Berhasil!")
                         st.subheader("Hasil Perhitungan Tagihan Bulan Ini")
                         
@@ -235,7 +296,6 @@ with tab2:
                         st.info(f"Jumlah Dibayar: Rp {bayar_bulan_ini:,.0f}")
                         st.markdown("---")
 
-
                         # --- PROSES PENYIMPANAN DATA ---
                         try:
                             st.write("Menyimpan data ke Google Sheets...")
@@ -245,7 +305,6 @@ with tab2:
                             st.success(f"✅ Data untuk '{nama_pelanggan_terpilih}' berhasil diperbarui!")
                             st.balloons()
                             
-                            # Tombol untuk me-refresh halaman secara manual setelah update
                             if st.button("Selesai & Muat Ulang Data"):
                                 st.cache_data.clear()
                                 st.rerun()
@@ -297,3 +356,21 @@ with tab3:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Gagal menyimpan data pelanggan baru ke Google Sheets. Error: {e}")
+
+with tab4:
+    st.header("⚙️ Pengaturan Harga Per Meter Kubik")
+    st.info("Atur harga per meter kubik yang akan digunakan untuk menghitung tagihan.")
+    
+    # Tampilkan harga saat ini
+    st.metric("Harga Per m³ Saat Ini", f"Rp {HARGA_PER_METER_KUBIK:,.0f}")
+    
+    with st.form("form_update_harga"):
+        new_price = st.number_input("Masukkan Harga Baru (Rp)", min_value=0, step=100, value=int(HARGA_PER_METER_KUBIK))
+        submit_price = st.form_submit_button("Simpan Harga Baru")
+        
+        if submit_price:
+            if spreadsheet:
+                update_config(spreadsheet, new_price)
+                st.rerun()
+            else:
+                st.error("Tidak dapat memperbarui harga karena koneksi ke Google Sheets gagal.")
